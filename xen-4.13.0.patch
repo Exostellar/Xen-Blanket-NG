@@ -1,0 +1,2231 @@
+diff -Naur clean_version/xen-4.13.0/tools/flask/policy/modules/dom0.te xen-4.13.0/tools/flask/policy/modules/dom0.te
+--- clean_version/xen-4.13.0/tools/flask/policy/modules/dom0.te	2019-12-17 09:23:09.000000000 -0500
++++ xen-4.13.0/tools/flask/policy/modules/dom0.te	2020-03-30 10:22:56.272695896 -0400
+@@ -22,9 +22,9 @@
+ # Allow dom0 to use all XENVER_ subops that have checks.
+ # Note that dom0 is part of domain_type so this has duplicates.
+ allow dom0_t xen_t:version {
+-	xen_extraversion xen_compile_info xen_capabilities
++	xen_version xen_extraversion xen_compile_info xen_capabilities
+ 	xen_changeset xen_pagesize xen_guest_handle xen_commandline
+-	xen_build_id
++	xen_build_id xen_get_features xen_platform_parameters
+ };
+ 
+ allow dom0_t xen_t:mmu memorymap;
+@@ -43,6 +43,16 @@
+ };
+ allow dom0_t dom0_t:resource { add remove };
+ 
++# Allow dom0 to communicate with a nested Xen hypervisor
++allow dom0_t nestedxen_t:version { xen_version xen_get_features };
++allow dom0_t nestedxen_t:mmu physmap;
++allow dom0_t nestedxen_t:hvm { setparam getparam };
++allow dom0_t nestedxen_t:grant query;
++allow dom0_t nestedxen_t:nested_event {
++    alloc_unbound bind_vcpu close send unmask
++};
++allow dom0_t nestedxen_t:domain { shutdown };
++
+ # These permissions allow using the FLASK security server to compute access
+ # checks locally, which could be used by a domain or service (such as xenstore)
+ # that does not have its own security server to make access decisions based on
+diff -Naur clean_version/xen-4.13.0/tools/flask/policy/modules/guest_features.te xen-4.13.0/tools/flask/policy/modules/guest_features.te
+--- clean_version/xen-4.13.0/tools/flask/policy/modules/guest_features.te	2019-12-17 09:23:09.000000000 -0500
++++ xen-4.13.0/tools/flask/policy/modules/guest_features.te	2020-03-30 10:22:56.272695896 -0400
+@@ -21,8 +21,9 @@
+ 
+ # For normal guests, allow all queries except XENVER_commandline.
+ allow domain_type xen_t:version {
+-    xen_extraversion xen_compile_info xen_capabilities
+-    xen_changeset xen_pagesize xen_guest_handle
++    xen_version xen_extraversion xen_compile_info xen_capabilities
++    xen_changeset xen_pagesize xen_guest_handle xen_get_features
++    xen_platform_parameters
+ };
+ 
+ # Version queries don't need auditing when denied.  They can be
+diff -Naur clean_version/xen-4.13.0/tools/flask/policy/modules/xen.te xen-4.13.0/tools/flask/policy/modules/xen.te
+--- clean_version/xen-4.13.0/tools/flask/policy/modules/xen.te	2019-12-17 09:23:09.000000000 -0500
++++ xen-4.13.0/tools/flask/policy/modules/xen.te	2020-03-30 10:22:56.273695930 -0400
+@@ -26,6 +26,9 @@
+ # The hypervisor itself
+ type xen_t, xen_type, mls_priv;
+ 
++# A nested Xen hypervisor, if any
++type nestedxen_t, xen_type;
++
+ # Domain 0
+ declare_singleton_domain(dom0_t, mls_priv);
+ 
+diff -Naur clean_version/xen-4.13.0/tools/flask/policy/policy/initial_sids xen-4.13.0/tools/flask/policy/policy/initial_sids
+--- clean_version/xen-4.13.0/tools/flask/policy/policy/initial_sids	2019-12-17 09:23:09.000000000 -0500
++++ xen-4.13.0/tools/flask/policy/policy/initial_sids	2020-03-30 10:22:56.273695930 -0400
+@@ -16,3 +16,6 @@
+ # Initial SIDs used by the toolstack for domains without defined labels
+ sid domU gen_context(system_u:system_r:domU_t,s0)
+ sid domDM gen_context(system_u:system_r:dm_dom_t,s0)
++
++# Initial SID for nested Xen on Xen
++sid nestedxen gen_context(system_u:system_r:nestedxen_t,s0)
+diff -Naur clean_version/xen-4.13.0/xen/arch/x86/apic.c xen-4.13.0/xen/arch/x86/apic.c
+--- clean_version/xen-4.13.0/xen/arch/x86/apic.c	2019-12-17 09:23:09.000000000 -0500
++++ xen-4.13.0/xen/arch/x86/apic.c	2020-03-30 10:23:00.316833267 -0400
+@@ -1226,7 +1226,7 @@
+      */
+     __setup_APIC_LVTT(1000000000);
+ 
+-    if ( !xen_guest )
++    if ( !xen_detected )
+         /*
+          * The timer chip counts down to zero. Let's wait
+          * for a wraparound to start exact measurement:
+@@ -1246,7 +1246,7 @@
+      * Let's wait LOOPS ticks:
+      */
+     for (i = 0; i < LOOPS; i++)
+-        if ( !xen_guest )
++        if ( !xen_detected )
+             wait_8254_wraparound();
+         else
+             wait_tick_pvh();
+diff -Naur clean_version/xen-4.13.0/xen/arch/x86/guest/hypercall_page.S xen-4.13.0/xen/arch/x86/guest/hypercall_page.S
+--- clean_version/xen-4.13.0/xen/arch/x86/guest/hypercall_page.S	2019-12-17 09:23:09.000000000 -0500
++++ xen-4.13.0/xen/arch/x86/guest/hypercall_page.S	2020-03-30 10:23:00.329833708 -0400
+@@ -60,6 +60,12 @@
+ DECLARE_HYPERCALL(kexec_op)
+ DECLARE_HYPERCALL(argo_op)
+ DECLARE_HYPERCALL(xenpmu_op)
++DECLARE_HYPERCALL(nested_xen_version)
++DECLARE_HYPERCALL(nested_memory_op)
++DECLARE_HYPERCALL(nested_hvm_op)
++DECLARE_HYPERCALL(nested_grant_table_op)
++DECLARE_HYPERCALL(nested_event_channel_op)
++DECLARE_HYPERCALL(nested_sched_op)
+ 
+ DECLARE_HYPERCALL(arch_0)
+ DECLARE_HYPERCALL(arch_1)
+diff -Naur clean_version/xen-4.13.0/xen/arch/x86/guest/Makefile xen-4.13.0/xen/arch/x86/guest/Makefile
+--- clean_version/xen-4.13.0/xen/arch/x86/guest/Makefile	2019-12-17 09:23:09.000000000 -0500
++++ xen-4.13.0/xen/arch/x86/guest/Makefile	2020-03-30 10:23:00.329833708 -0400
+@@ -1,4 +1,8 @@
++ifneq ($(filter y,$(CONFIG_XEN_GUEST) $(CONFIG_XEN_NESTED) $(CONFIG_PVH_GUEST)),)
+ obj-y += hypercall_page.o
++endif
+ obj-y += xen.o
++obj-$(CONFIG_XEN_GUEST) += xen-guest.o
++obj-$(CONFIG_XEN_NESTED) += xen-nested.o
+ 
+ obj-bin-$(CONFIG_PVH_GUEST) += pvh-boot.init.o
+diff -Naur clean_version/xen-4.13.0/xen/arch/x86/guest/xen.c xen-4.13.0/xen/arch/x86/guest/xen.c
+--- clean_version/xen-4.13.0/xen/arch/x86/guest/xen.c	2019-12-17 09:23:09.000000000 -0500
++++ xen-4.13.0/xen/arch/x86/guest/xen.c	2020-03-30 10:23:00.330833742 -0400
+@@ -22,9 +22,7 @@
+ #include <xen/init.h>
+ #include <xen/mm.h>
+ #include <xen/pfn.h>
+-#include <xen/rangeset.h>
+ #include <xen/types.h>
+-#include <xen/pv_console.h>
+ 
+ #include <asm/apic.h>
+ #include <asm/e820.h>
+@@ -35,17 +33,10 @@
+ #include <public/arch-x86/cpuid.h>
+ #include <public/hvm/params.h>
+ 
+-bool __read_mostly xen_guest;
++/* xen_detected: Xen running on Xen detected */
++bool __read_mostly xen_detected;
+ 
+ static __read_mostly uint32_t xen_cpuid_base;
+-extern char hypercall_page[];
+-static struct rangeset *mem;
+-
+-DEFINE_PER_CPU(unsigned int, vcpu_id);
+-
+-static struct vcpu_info *vcpu_info;
+-static unsigned long vcpu_info_mapped[BITS_TO_LONGS(NR_CPUS)];
+-DEFINE_PER_CPU(struct vcpu_info *, vcpu_info);
+ 
+ static void __init find_xen_leaves(void)
+ {
+@@ -69,7 +60,7 @@
+ 
+ void __init probe_hypervisor(void)
+ {
+-    if ( xen_guest || !cpu_has_hypervisor )
++    if ( xen_detected || !cpu_has_hypervisor )
+         return;
+ 
+     find_xen_leaves();
+@@ -77,224 +68,24 @@
+     if ( !xen_cpuid_base )
+         return;
+ 
+-    /* Fill the hypercall page. */
+-    wrmsrl(cpuid_ebx(xen_cpuid_base + 2), __pa(hypercall_page));
+-
+-    xen_guest = true;
+-}
++    xen_detected = true;
+ 
+-static void map_shared_info(void)
+-{
+-    mfn_t mfn;
+-    struct xen_add_to_physmap xatp = {
+-        .domid = DOMID_SELF,
+-        .space = XENMAPSPACE_shared_info,
+-    };
+-    unsigned int i;
+-    unsigned long rc;
+-
+-    if ( hypervisor_alloc_unused_page(&mfn) )
+-        panic("unable to reserve shared info memory page\n");
+-
+-    xatp.gpfn = mfn_x(mfn);
+-    rc = xen_hypercall_memory_op(XENMEM_add_to_physmap, &xatp);
+-    if ( rc )
+-        panic("failed to map shared_info page: %ld\n", rc);
+-
+-    set_fixmap(FIX_XEN_SHARED_INFO, mfn_x(mfn) << PAGE_SHIFT);
+-
+-    /* Mask all upcalls */
+-    for ( i = 0; i < ARRAY_SIZE(XEN_shared_info->evtchn_mask); i++ )
+-        write_atomic(&XEN_shared_info->evtchn_mask[i], ~0ul);
+-}
+-
+-static int map_vcpuinfo(void)
+-{
+-    unsigned int vcpu = this_cpu(vcpu_id);
+-    struct vcpu_register_vcpu_info info;
+-    int rc;
+-
+-    if ( !vcpu_info )
+-    {
+-        this_cpu(vcpu_info) = &XEN_shared_info->vcpu_info[vcpu];
+-        return 0;
+-    }
+-
+-    if ( test_bit(vcpu, vcpu_info_mapped) )
+-    {
+-        this_cpu(vcpu_info) = &vcpu_info[vcpu];
+-        return 0;
+-    }
+-
+-    info.mfn = virt_to_mfn(&vcpu_info[vcpu]);
+-    info.offset = (unsigned long)&vcpu_info[vcpu] & ~PAGE_MASK;
+-    rc = xen_hypercall_vcpu_op(VCPUOP_register_vcpu_info, vcpu, &info);
+-    if ( rc )
+-    {
+-        BUG_ON(vcpu >= XEN_LEGACY_MAX_VCPUS);
+-        this_cpu(vcpu_info) = &XEN_shared_info->vcpu_info[vcpu];
+-    }
++    if ( pv_shim || pvh_boot )
++        xen_guest_enable();
+     else
+-    {
+-        this_cpu(vcpu_info) = &vcpu_info[vcpu];
+-        set_bit(vcpu, vcpu_info_mapped);
+-    }
+-
+-    return rc;
++        xen_nested_enable();
+ }
+ 
+-static void set_vcpu_id(void)
++void __init hypervisor_print_info(void)
+ {
+     uint32_t eax, ebx, ecx, edx;
++    unsigned int major, minor;
+ 
+-    ASSERT(xen_cpuid_base);
+-
+-    /* Fetch vcpu id from cpuid. */
+-    cpuid(xen_cpuid_base + 4, &eax, &ebx, &ecx, &edx);
+-    if ( eax & XEN_HVM_CPUID_VCPU_ID_PRESENT )
+-        this_cpu(vcpu_id) = ebx;
+-    else
+-        this_cpu(vcpu_id) = smp_processor_id();
+-}
+-
+-static void __init init_memmap(void)
+-{
+-    unsigned int i;
+-
+-    mem = rangeset_new(NULL, "host memory map", 0);
+-    if ( !mem )
+-        panic("failed to allocate PFN usage rangeset\n");
+-
+-    /*
+-     * Mark up to the last memory page (or 4GiB) as RAM. This is done because
+-     * Xen doesn't know the position of possible MMIO holes, so at least try to
+-     * avoid the know MMIO hole below 4GiB. Note that this is subject to future
+-     * discussion and improvements.
+-     */
+-    if ( rangeset_add_range(mem, 0, max_t(unsigned long, max_page - 1,
+-                                          PFN_DOWN(GB(4) - 1))) )
+-        panic("unable to add RAM to in-use PFN rangeset\n");
+-
+-    for ( i = 0; i < e820.nr_map; i++ )
+-    {
+-        struct e820entry *e = &e820.map[i];
+-
+-        if ( rangeset_add_range(mem, PFN_DOWN(e->addr),
+-                                PFN_UP(e->addr + e->size - 1)) )
+-            panic("unable to add range [%#lx, %#lx] to in-use PFN rangeset\n",
+-                  PFN_DOWN(e->addr), PFN_UP(e->addr + e->size - 1));
+-    }
+-}
+-
+-static void xen_evtchn_upcall(struct cpu_user_regs *regs)
+-{
+-    struct vcpu_info *vcpu_info = this_cpu(vcpu_info);
+-    unsigned long pending;
+-
+-    vcpu_info->evtchn_upcall_pending = 0;
+-    pending = xchg(&vcpu_info->evtchn_pending_sel, 0);
+-
+-    while ( pending )
+-    {
+-        unsigned int l1 = find_first_set_bit(pending);
+-        unsigned long evtchn = xchg(&XEN_shared_info->evtchn_pending[l1], 0);
+-
+-        __clear_bit(l1, &pending);
+-        evtchn &= ~XEN_shared_info->evtchn_mask[l1];
+-        while ( evtchn )
+-        {
+-            unsigned int port = find_first_set_bit(evtchn);
+-
+-            __clear_bit(port, &evtchn);
+-            port += l1 * BITS_PER_LONG;
+-
+-            if ( pv_console && port == pv_console_evtchn() )
+-                pv_console_rx(regs);
+-            else if ( pv_shim )
+-                pv_shim_inject_evtchn(port);
+-        }
+-    }
+-
+-    ack_APIC_irq();
+-}
+-
+-static void init_evtchn(void)
+-{
+-    static uint8_t evtchn_upcall_vector;
+-    int rc;
+-
+-    if ( !evtchn_upcall_vector )
+-        alloc_direct_apic_vector(&evtchn_upcall_vector, xen_evtchn_upcall);
++    cpuid(xen_cpuid_base + 1, &eax, &ebx, &ecx, &edx);
+ 
+-    ASSERT(evtchn_upcall_vector);
+-
+-    rc = xen_hypercall_set_evtchn_upcall_vector(this_cpu(vcpu_id),
+-                                                evtchn_upcall_vector);
+-    if ( rc )
+-        panic("Unable to set evtchn upcall vector: %d\n", rc);
+-
+-    /* Trick toolstack to think we are enlightened */
+-    {
+-        struct xen_hvm_param a = {
+-            .domid = DOMID_SELF,
+-            .index = HVM_PARAM_CALLBACK_IRQ,
+-            .value = 1,
+-        };
+-
+-        BUG_ON(xen_hypercall_hvm_op(HVMOP_set_param, &a));
+-    }
+-}
+-
+-void __init hypervisor_setup(void)
+-{
+-    init_memmap();
+-
+-    map_shared_info();
+-
+-    set_vcpu_id();
+-    vcpu_info = xzalloc_array(struct vcpu_info, nr_cpu_ids);
+-    if ( map_vcpuinfo() )
+-    {
+-        xfree(vcpu_info);
+-        vcpu_info = NULL;
+-    }
+-    if ( !vcpu_info && nr_cpu_ids > XEN_LEGACY_MAX_VCPUS )
+-    {
+-        unsigned int i;
+-
+-        for ( i = XEN_LEGACY_MAX_VCPUS; i < nr_cpu_ids; i++ )
+-            __cpumask_clear_cpu(i, &cpu_present_map);
+-        nr_cpu_ids = XEN_LEGACY_MAX_VCPUS;
+-        printk(XENLOG_WARNING
+-               "unable to map vCPU info, limiting vCPUs to: %u\n",
+-               XEN_LEGACY_MAX_VCPUS);
+-    }
+-
+-    init_evtchn();
+-}
+-
+-void hypervisor_ap_setup(void)
+-{
+-    set_vcpu_id();
+-    map_vcpuinfo();
+-    init_evtchn();
+-}
+-
+-int hypervisor_alloc_unused_page(mfn_t *mfn)
+-{
+-    unsigned long m;
+-    int rc;
+-
+-    rc = rangeset_claim_range(mem, 1, &m);
+-    if ( !rc )
+-        *mfn = _mfn(m);
+-
+-    return rc;
+-}
+-
+-int hypervisor_free_unused_page(mfn_t mfn)
+-{
+-    return rangeset_remove_range(mem, mfn_x(mfn), mfn_x(mfn));
++    major = eax >> 16;
++    minor = eax & 0xffff;
++    printk("Nested Xen version %u.%u.\n", major, minor);
+ }
+ 
+ uint32_t hypervisor_cpuid_base(void)
+@@ -302,35 +93,6 @@
+     return xen_cpuid_base;
+ }
+ 
+-static void ap_resume(void *unused)
+-{
+-    map_vcpuinfo();
+-    init_evtchn();
+-}
+-
+-void hypervisor_resume(void)
+-{
+-    /* Reset shared info page. */
+-    map_shared_info();
+-
+-    /*
+-     * Reset vcpu_info. Just clean the mapped bitmap and try to map the vcpu
+-     * area again. On failure to map (when it was previously mapped) panic
+-     * since it's impossible to safely shut down running guest vCPUs in order
+-     * to meet the new XEN_LEGACY_MAX_VCPUS requirement.
+-     */
+-    bitmap_zero(vcpu_info_mapped, NR_CPUS);
+-    if ( map_vcpuinfo() && nr_cpu_ids > XEN_LEGACY_MAX_VCPUS )
+-        panic("unable to remap vCPU info and vCPUs > legacy limit\n");
+-
+-    /* Setup event channel upcall vector. */
+-    init_evtchn();
+-    smp_call_function(ap_resume, NULL, 1);
+-
+-    if ( pv_console )
+-        pv_console_init();
+-}
+-
+ /*
+  * Local variables:
+  * mode: C
+diff -Naur clean_version/xen-4.13.0/xen/arch/x86/guest/xen-guest.c xen-4.13.0/xen/arch/x86/guest/xen-guest.c
+--- clean_version/xen-4.13.0/xen/arch/x86/guest/xen-guest.c	1969-12-31 19:00:00.000000000 -0500
++++ xen-4.13.0/xen/arch/x86/guest/xen-guest.c	2020-03-30 10:23:00.329833708 -0400
+@@ -0,0 +1,311 @@
++/******************************************************************************
++ * arch/x86/guest/xen-guest.c
++ *
++ * Support for running a single VM with Xen as a guest.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; If not, see <http://www.gnu.org/licenses/>.
++ *
++ * Copyright (c) 2017 Citrix Systems Ltd.
++ */
++#include <xen/event.h>
++#include <xen/init.h>
++#include <xen/mm.h>
++#include <xen/pfn.h>
++#include <xen/rangeset.h>
++#include <xen/types.h>
++#include <xen/pv_console.h>
++
++#include <asm/apic.h>
++#include <asm/e820.h>
++#include <asm/guest.h>
++#include <asm/msr.h>
++#include <asm/processor.h>
++
++#include <public/arch-x86/cpuid.h>
++#include <public/hvm/params.h>
++
++extern char hypercall_page[];
++
++bool __read_mostly xen_guest;
++
++static struct rangeset *mem;
++
++DEFINE_PER_CPU(unsigned int, vcpu_id);
++
++static struct vcpu_info *vcpu_info;
++static unsigned long vcpu_info_mapped[BITS_TO_LONGS(NR_CPUS)];
++DEFINE_PER_CPU(struct vcpu_info *, vcpu_info);
++
++void xen_guest_enable(void)
++{
++    /* Fill the hypercall page. */
++    wrmsrl(cpuid_ebx(hypervisor_cpuid_base() + 2), __pa(hypercall_page));
++
++    xen_guest = true;
++}
++
++static void map_shared_info(void)
++{
++    mfn_t mfn;
++    struct xen_add_to_physmap xatp = {
++        .domid = DOMID_SELF,
++        .space = XENMAPSPACE_shared_info,
++    };
++    unsigned int i;
++    unsigned long rc;
++
++    if ( hypervisor_alloc_unused_page(&mfn) )
++        panic("unable to reserve shared info memory page\n");
++
++    xatp.gpfn = mfn_x(mfn);
++    rc = xen_hypercall_memory_op(XENMEM_add_to_physmap, &xatp);
++    if ( rc )
++        panic("failed to map shared_info page: %ld\n", rc);
++
++    set_fixmap(FIX_XEN_SHARED_INFO, mfn_x(mfn) << PAGE_SHIFT);
++
++    /* Mask all upcalls */
++    for ( i = 0; i < ARRAY_SIZE(XEN_shared_info->evtchn_mask); i++ )
++        write_atomic(&XEN_shared_info->evtchn_mask[i], ~0ul);
++}
++
++static int map_vcpuinfo(void)
++{
++    unsigned int vcpu = this_cpu(vcpu_id);
++    struct vcpu_register_vcpu_info info;
++    int rc;
++
++    if ( !vcpu_info )
++    {
++        this_cpu(vcpu_info) = &XEN_shared_info->vcpu_info[vcpu];
++        return 0;
++    }
++
++    if ( test_bit(vcpu, vcpu_info_mapped) )
++    {
++        this_cpu(vcpu_info) = &vcpu_info[vcpu];
++        return 0;
++    }
++
++    info.mfn = virt_to_mfn(&vcpu_info[vcpu]);
++    info.offset = (unsigned long)&vcpu_info[vcpu] & ~PAGE_MASK;
++    rc = xen_hypercall_vcpu_op(VCPUOP_register_vcpu_info, vcpu, &info);
++    if ( rc )
++    {
++        BUG_ON(vcpu >= XEN_LEGACY_MAX_VCPUS);
++        this_cpu(vcpu_info) = &XEN_shared_info->vcpu_info[vcpu];
++    }
++    else
++    {
++        this_cpu(vcpu_info) = &vcpu_info[vcpu];
++        set_bit(vcpu, vcpu_info_mapped);
++    }
++
++    return rc;
++}
++
++static void set_vcpu_id(void)
++{
++    uint32_t cpuid_base, eax, ebx, ecx, edx;
++
++    cpuid_base = hypervisor_cpuid_base();
++
++    ASSERT(cpuid_base);
++
++    /* Fetch vcpu id from cpuid. */
++    cpuid(cpuid_base + 4, &eax, &ebx, &ecx, &edx);
++    if ( eax & XEN_HVM_CPUID_VCPU_ID_PRESENT )
++        this_cpu(vcpu_id) = ebx;
++    else
++        this_cpu(vcpu_id) = smp_processor_id();
++}
++
++static void __init init_memmap(void)
++{
++    unsigned int i;
++
++    mem = rangeset_new(NULL, "host memory map", 0);
++    if ( !mem )
++        panic("failed to allocate PFN usage rangeset\n");
++
++    /*
++     * Mark up to the last memory page (or 4GiB) as RAM. This is done because
++     * Xen doesn't know the position of possible MMIO holes, so at least try to
++     * avoid the know MMIO hole below 4GiB. Note that this is subject to future
++     * discussion and improvements.
++     */
++    if ( rangeset_add_range(mem, 0, max_t(unsigned long, max_page - 1,
++                                          PFN_DOWN(GB(4) - 1))) )
++        panic("unable to add RAM to in-use PFN rangeset\n");
++
++    for ( i = 0; i < e820.nr_map; i++ )
++    {
++        struct e820entry *e = &e820.map[i];
++
++        if ( rangeset_add_range(mem, PFN_DOWN(e->addr),
++                                PFN_UP(e->addr + e->size - 1)) )
++            panic("unable to add range [%#lx, %#lx] to in-use PFN rangeset\n",
++                  PFN_DOWN(e->addr), PFN_UP(e->addr + e->size - 1));
++    }
++}
++
++static void xen_evtchn_upcall(struct cpu_user_regs *regs)
++{
++    struct vcpu_info *vcpu_info = this_cpu(vcpu_info);
++    unsigned long pending;
++
++    vcpu_info->evtchn_upcall_pending = 0;
++    pending = xchg(&vcpu_info->evtchn_pending_sel, 0);
++
++    while ( pending )
++    {
++        unsigned int l1 = find_first_set_bit(pending);
++        unsigned long evtchn = xchg(&XEN_shared_info->evtchn_pending[l1], 0);
++
++        __clear_bit(l1, &pending);
++        evtchn &= ~XEN_shared_info->evtchn_mask[l1];
++        while ( evtchn )
++        {
++            unsigned int port = find_first_set_bit(evtchn);
++
++            __clear_bit(port, &evtchn);
++            port += l1 * BITS_PER_LONG;
++
++            if ( pv_console && port == pv_console_evtchn() )
++                pv_console_rx(regs);
++            else if ( pv_shim )
++                pv_shim_inject_evtchn(port);
++        }
++    }
++
++    ack_APIC_irq();
++}
++
++static void init_evtchn(void)
++{
++    static uint8_t evtchn_upcall_vector;
++    int rc;
++
++    if ( !evtchn_upcall_vector )
++        alloc_direct_apic_vector(&evtchn_upcall_vector, xen_evtchn_upcall);
++
++    ASSERT(evtchn_upcall_vector);
++
++    rc = xen_hypercall_set_evtchn_upcall_vector(this_cpu(vcpu_id),
++                                                evtchn_upcall_vector);
++    if ( rc )
++        panic("Unable to set evtchn upcall vector: %d\n", rc);
++
++    /* Trick toolstack to think we are enlightened */
++    {
++        struct xen_hvm_param a = {
++            .domid = DOMID_SELF,
++            .index = HVM_PARAM_CALLBACK_IRQ,
++            .value = 1,
++        };
++
++        BUG_ON(xen_hypercall_hvm_op(HVMOP_set_param, &a));
++    }
++}
++
++void __init hypervisor_setup(void)
++{
++    init_memmap();
++
++    map_shared_info();
++
++    set_vcpu_id();
++    vcpu_info = xzalloc_array(struct vcpu_info, nr_cpu_ids);
++    if ( map_vcpuinfo() )
++    {
++        xfree(vcpu_info);
++        vcpu_info = NULL;
++    }
++    if ( !vcpu_info && nr_cpu_ids > XEN_LEGACY_MAX_VCPUS )
++    {
++        unsigned int i;
++
++        for ( i = XEN_LEGACY_MAX_VCPUS; i < nr_cpu_ids; i++ )
++            __cpumask_clear_cpu(i, &cpu_present_map);
++        nr_cpu_ids = XEN_LEGACY_MAX_VCPUS;
++        printk(XENLOG_WARNING
++               "unable to map vCPU info, limiting vCPUs to: %u\n",
++               XEN_LEGACY_MAX_VCPUS);
++    }
++
++    init_evtchn();
++}
++
++void hypervisor_ap_setup(void)
++{
++    set_vcpu_id();
++    map_vcpuinfo();
++    init_evtchn();
++}
++
++int hypervisor_alloc_unused_page(mfn_t *mfn)
++{
++    unsigned long m;
++    int rc;
++
++    rc = rangeset_claim_range(mem, 1, &m);
++    if ( !rc )
++        *mfn = _mfn(m);
++
++    return rc;
++}
++
++int hypervisor_free_unused_page(mfn_t mfn)
++{
++    return rangeset_remove_range(mem, mfn_x(mfn), mfn_x(mfn));
++}
++
++static void ap_resume(void *unused)
++{
++    map_vcpuinfo();
++    init_evtchn();
++}
++
++void hypervisor_resume(void)
++{
++    /* Reset shared info page. */
++    map_shared_info();
++
++    /*
++     * Reset vcpu_info. Just clean the mapped bitmap and try to map the vcpu
++     * area again. On failure to map (when it was previously mapped) panic
++     * since it's impossible to safely shut down running guest vCPUs in order
++     * to meet the new XEN_LEGACY_MAX_VCPUS requirement.
++     */
++    bitmap_zero(vcpu_info_mapped, NR_CPUS);
++    if ( map_vcpuinfo() && nr_cpu_ids > XEN_LEGACY_MAX_VCPUS )
++        panic("unable to remap vCPU info and vCPUs > legacy limit\n");
++
++    /* Setup event channel upcall vector. */
++    init_evtchn();
++    smp_call_function(ap_resume, NULL, 1);
++
++    if ( pv_console )
++        pv_console_init();
++}
++
++/*
++ * Local variables:
++ * mode: C
++ * c-file-style: "BSD"
++ * c-basic-offset: 4
++ * tab-width: 4
++ * indent-tabs-mode: nil
++ * End:
++ */
+diff -Naur clean_version/xen-4.13.0/xen/arch/x86/guest/xen-nested.c xen-4.13.0/xen/arch/x86/guest/xen-nested.c
+--- clean_version/xen-4.13.0/xen/arch/x86/guest/xen-nested.c	1969-12-31 19:00:00.000000000 -0500
++++ xen-4.13.0/xen/arch/x86/guest/xen-nested.c	2020-03-30 10:23:00.330833742 -0400
+@@ -0,0 +1,610 @@
++/*
++ * arch/x86/guest/xen-nested.c
++ *
++ * Hypercall implementations for nested PV drivers interface.
++ *
++ * Copyright (c) 2019 Star Lab Corp
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
++ */
++#include <xen/event.h>
++#include <xen/config.h>
++#include <xen/errno.h>
++#include <xen/guest_access.h>
++#include <xen/hypercall.h>
++#include <xen/lib.h>
++#include <xen/sched.h>
++
++#include <public/event_channel.h>
++#include <public/grant_table.h>
++#include <public/hvm/hvm_op.h>
++#include <public/memory.h>
++#include <public/sched.h>
++#include <public/version.h>
++#include <public/xen.h>
++
++#include <asm/apic.h>
++#include <asm/guest/hypercall.h>
++#include <asm/guest/xen.h>
++
++#ifdef CONFIG_COMPAT
++#include <compat/memory.h>
++#endif
++
++extern char hypercall_page[];
++
++/* xen_nested: support for nested PV interface enabled */
++static struct rangeset *mem;
++static bool __read_mostly xen_nested;
++
++static void __init init_memmap(void)
++{
++    unsigned int i;
++
++    mem = rangeset_new(NULL, "host memory map", 0);
++    if ( !mem )
++        panic("failed to allocate PFN usage rangeset\n");
++
++    /*
++     * Mark up to the last memory page (or 4GiB) as RAM. This is done because
++     * Xen doesn't know the position of possible MMIO holes, so at least try to
++     * avoid the know MMIO hole below 4GiB. Note that this is subject to future
++     * discussion and improvements.
++     */
++    if ( rangeset_add_range(mem, 0, max_t(unsigned long, max_page - 1,
++                                          PFN_DOWN(GB(4) - 1))) )
++        panic("unable to add RAM to in-use PFN rangeset\n");
++
++    for ( i = 0; i < e820.nr_map; i++ )
++    {
++        struct e820entry *e = &e820.map[i];
++
++        if ( rangeset_add_range(mem, PFN_DOWN(e->addr),
++                                PFN_UP(e->addr + e->size - 1)) )
++            panic("unable to add range [%#lx, %#lx] to in-use PFN rangeset\n",
++                  PFN_DOWN(e->addr), PFN_UP(e->addr + e->size - 1));
++    }
++}
++
++static int hypervisor_alloc_unused_page(mfn_t *mfn)
++{
++    unsigned long m;
++    int rc;
++
++    rc = rangeset_claim_range(mem, 1, &m);
++    if ( !rc )
++        *mfn = _mfn(m);
++
++    return rc;
++}
++
++static void map_shared_info(void)
++{
++    mfn_t mfn;
++    struct xen_add_to_physmap xatp = {
++        .domid = DOMID_SELF,
++        .space = XENMAPSPACE_shared_info,
++    };
++    //unsigned int i;
++    unsigned long rc;
++
++    if ( hypervisor_alloc_unused_page(&mfn) )
++        panic("unable to reserve shared info memory page\n");
++
++    xatp.gpfn = mfn_x(mfn);
++    rc = xen_hypercall_memory_op(XENMEM_add_to_physmap, &xatp);
++    if ( rc )
++        panic("failed to map shared_info page: %ld\n", rc);
++
++    set_fixmap(FIX_XEN_SHARED_INFO, mfn_x(mfn) << PAGE_SHIFT);
++
++    /* Mask all upcalls */
++    //for ( i = 0; i < ARRAY_SIZE(XEN_shared_info->evtchn_mask); i++ )
++    //   write_atomic(&XEN_shared_info->evtchn_mask[i], ~0ul);
++
++    gprintk(XENLOG_DEBUG, "Finished setting up shared_info.\n");
++}
++
++void xen_nested_enable(void)
++{
++    /* Fill the hypercall page. */
++    wrmsrl(cpuid_ebx(hypervisor_cpuid_base() + 2), __pa(hypercall_page));
++
++    xen_nested = true;
++
++
++}
++
++long do_nested_xen_version(int cmd, XEN_GUEST_HANDLE_PARAM(void) arg)
++{
++    long ret;
++
++    if ( !xen_nested )
++        return -ENOSYS;
++
++    ret = xsm_nested_xen_version(XSM_PRIV, current->domain, cmd);
++    if ( ret )
++        return ret;
++
++    gprintk(XENLOG_DEBUG, "Nested xen_version: %d.\n", cmd);
++
++    switch ( cmd )
++    {
++    case XENVER_version:
++        return xen_hypercall_xen_version(XENVER_version, 0);
++
++    case XENVER_get_features:
++    {
++        xen_feature_info_t fi;
++
++        if ( copy_from_guest(&fi, arg, 1) )
++            return -EFAULT;
++
++        ret = xen_hypercall_xen_version(XENVER_get_features, &fi);
++        if ( ret )
++            return ret;
++
++        if ( __copy_to_guest(arg, &fi, 1) )
++            return -EFAULT;
++
++        return 0;
++    }
++
++    default:
++        gprintk(XENLOG_ERR, "Nested xen_version op %d not implemented.\n", cmd);
++        return -EOPNOTSUPP;
++    }
++}
++
++static long nested_add_to_physmap(struct xen_add_to_physmap xatp)
++{
++    struct domain *d;
++    long ret;
++
++    if ( !xen_nested )
++        return -ENOSYS;
++
++    if ( (xatp.space != XENMAPSPACE_shared_info) &&
++         (xatp.space != XENMAPSPACE_grant_table) )
++    {
++        gprintk(XENLOG_ERR, "Nested memory op: unknown xatp.space: %u\n",
++                xatp.space);
++        return -EINVAL;
++    }
++
++    if ( xatp.domid != DOMID_SELF )
++        return -EPERM;
++
++    ret = xsm_nested_add_to_physmap(XSM_PRIV, current->domain);
++    if ( ret )
++        return ret;
++
++    gprintk(XENLOG_DEBUG, "Nested XENMEM_add_to_physmap: %d\n", xatp.space);
++
++    if(xatp.space == XENMAPSPACE_shared_info) {
++    	gprintk(XENLOG_DEBUG, "mapping shared_info in Xen...\n");
++    	init_memmap();
++        map_shared_info();
++    }
++
++    d = rcu_lock_current_domain();
++
++    ret = xen_hypercall_memory_op(XENMEM_add_to_physmap, &xatp);
++
++    rcu_unlock_domain(d);
++
++    if ( ret )
++        gprintk(XENLOG_ERR, "Nested memory op failed add_to_physmap"
++                            " for %d with %ld\n", xatp.space, ret);
++    return ret;
++}
++
++long do_nested_memory_op(int cmd, XEN_GUEST_HANDLE_PARAM(void) arg)
++{
++    struct xen_add_to_physmap xatp;
++
++    if ( cmd != XENMEM_add_to_physmap )
++    {
++        gprintk(XENLOG_ERR, "Nested memory op %u not implemented.\n", cmd);
++        return -EOPNOTSUPP;
++    }
++
++    if ( copy_from_guest(&xatp, arg, 1) )
++        return -EFAULT;
++
++    return nested_add_to_physmap(xatp);
++}
++
++#ifdef CONFIG_COMPAT
++int compat_nested_memory_op(int cmd, XEN_GUEST_HANDLE_PARAM(void) arg)
++{
++    struct compat_add_to_physmap cmp;
++    struct xen_add_to_physmap *nat = COMPAT_ARG_XLAT_VIRT_BASE;
++
++    if ( cmd != XENMEM_add_to_physmap )
++    {
++        gprintk(XENLOG_ERR, "Nested memory op %u not implemented.\n", cmd);
++        return -EOPNOTSUPP;
++    }
++
++    if ( copy_from_guest(&cmp, arg, 1) )
++        return -EFAULT;
++
++    XLAT_add_to_physmap(nat, &cmp);
++
++    return nested_add_to_physmap(*nat);
++}
++#endif
++
++static uint8_t evtchn_upcall_vector;
++static uint64_t evtchn_upcall_irq;
++static struct domain   *dom0_domain;
++
++static void xen_evtchn_upcall_hvm(struct cpu_user_regs *regs)
++{
++
++	//////////old////////////////
++	//struct evtchn *chn = evtchn_from_port(current->domain, pirq->evtchn);
++	//evtchn_port_set_pending(current->domain, smp_processor_id(), chn);
++	//int cpu = smp_processor_id();
++	//gprintk(XENLOG_DEBUG, "====XEN===xen_evtchn_upcall_hvm: cpu: %d\n", cpu);
++	//send_guest_vcpu_virq(dom0_domain->vcpu[smp_processor_id()], VIRQ_ARCH_4);
++
++	//XEN_shared_info->vcpu_info[cpu].evtchn_upcall_pending = 0;
++	//////////old////////////////
++
++	//sending guest pirq directly
++	//struct pirq *pirq = pirq_info(dom0_domain, domain_irq_to_pirq(dom0_domain, evtchn_upcall_irq));
++	//send_guest_pirq(dom0_domain, pirq);
++
++	//working with new event channel
++	//int cpu = current->processor;
++	//send_guest_vcpu_virq(dom0_domain->vcpu[cpu], VIRQ_ARCH_4);
++
++	//ASSERT(0);
++
++	//boradcast to all cpu's
++	//struct vcpu *v;
++	int cpu = smp_processor_id();
++
++	ack_APIC_irq();
++	//XEN_shared_info->vcpu_info[cpu].evtchn_upcall_pending = 0;
++	send_guest_vcpu_virq(dom0_domain->vcpu[cpu], VIRQ_ARCH_4);
++
++	//for_each_vcpu ( dom0_domain, v )
++	//{
++	//	XEN_shared_info->vcpu_info[v->vcpu_id].evtchn_upcall_pending = 0;
++	//	send_guest_vcpu_virq(v, VIRQ_ARCH_4);
++	//}
++
++
++}
++
++long do_nested_hvm_op(int cmd, XEN_GUEST_HANDLE_PARAM(void) arg)
++{
++    long ret;
++
++    if ( !xen_nested )
++        return -ENOSYS;
++
++    ret = xsm_nested_hvm_op(XSM_PRIV, current->domain, cmd);
++    if ( ret )
++        return ret;
++
++    switch ( cmd )
++    {
++    case HVMOP_set_param:
++    {
++    	struct xen_hvm_param a;
++        if ( copy_from_guest(&a, arg, 1) )
++            return -EFAULT;
++
++        if(0 && a.index == HVM_PARAM_CALLBACK_IRQ) {
++        	//TODO: this is disabled for now
++
++        	//struct vcpu *v;
++        	evtchn_upcall_irq = a.value;
++
++        	if ( !evtchn_upcall_vector ){
++				alloc_direct_apic_vector(&evtchn_upcall_vector, xen_evtchn_upcall_hvm);
++				dom0_domain = current->domain;
++			}
++
++			if ( !evtchn_upcall_vector )
++				return -EFAULT;
++
++			gprintk(XENLOG_DEBUG, "====XEN===HVM_PARAM_CALLBACK_IRQ is called. vector: %d\n", evtchn_upcall_vector);
++
++			//for_each_vcpu ( dom0_domain, v )
++			//{
++			//	send_guest_vcpu_virq(v, VIRQ_ARCH_4);
++			//}
++
++			a.value = ((uint64_t)0x02 << 56) | evtchn_upcall_vector;
++        }
++
++        ret = xen_hypercall_hvm_op(cmd, &a);
++        if(ret < 0) {
++        	gprintk(XENLOG_ERR, "====XEN===HVMOP_set_param failed, index: %d\n", a.index);
++        	return ret;
++        }
++
++        //original code using new evtchn_upcall_vector
++        if (a.index == HVM_PARAM_CALLBACK_IRQ) {
++        	struct xen_hvm_evtchn_upcall_vector b;
++        	struct vcpu *v;
++
++        	evtchn_upcall_irq = a.value;
++
++        	if ( !evtchn_upcall_vector ){
++				alloc_direct_apic_vector(&evtchn_upcall_vector, xen_evtchn_upcall_hvm);
++				dom0_domain = current->domain;
++			}
++
++			if ( !evtchn_upcall_vector )
++				return -EFAULT;
++
++			gprintk(XENLOG_DEBUG, "====XEN===HVMOP_set_evtchn_upcall_vector is called. vector: %d\n", evtchn_upcall_vector);
++			for_each_vcpu ( dom0_domain, v )
++			{
++				//send_guest_vcpu_virq(v, VIRQ_ARCH_4);
++				b.vcpu = v->vcpu_id;
++				b.vector = evtchn_upcall_vector;
++				ret = xen_hypercall_hvm_op(HVMOP_set_evtchn_upcall_vector, &b);
++				if(ret < 0) {
++					gprintk(XENLOG_ERR, "====XEN===HVMOP_set_evtchn_upcall_vector failed\n");
++					break;
++				}
++				gprintk(XENLOG_DEBUG, "====XEN===cpu-%d is set\n", v->vcpu_id);
++			}
++        }
++
++        return ret;
++    }
++
++    case HVMOP_set_evtchn_upcall_vector:
++    {
++    	struct xen_hvm_evtchn_upcall_vector a;
++
++    	if ( copy_from_guest(&a, arg, 1) )
++			return -EFAULT;
++
++    	if ( !evtchn_upcall_vector ){
++			alloc_direct_apic_vector(&evtchn_upcall_vector, xen_evtchn_upcall_hvm);
++			dom0_domain = current->domain;
++    	}
++
++		if ( !evtchn_upcall_vector )
++			return -EFAULT;
++
++		send_guest_vcpu_virq(dom0_domain->vcpu[smp_processor_id()], VIRQ_ARCH_4);
++
++		gprintk(XENLOG_ERR, "====XEN===HVMOP_set_evtchn_upcall_vector is called. vector: %d\n", evtchn_upcall_vector);
++
++		a.vector = evtchn_upcall_vector;
++
++    	return xen_hypercall_hvm_op(cmd, &a);
++    }
++
++    case HVMOP_get_param:
++    {
++    	struct xen_hvm_param a;
++        if ( copy_from_guest(&a, arg, 1) )
++            return -EFAULT;
++
++        ret = xen_hypercall_hvm_op(cmd, &a);
++
++        if ( !ret && __copy_to_guest(arg, &a, 1) )
++            return -EFAULT;
++
++        return ret;
++    }
++
++    default:
++        gprintk(XENLOG_ERR, "Nested hvm op %d not implemented.\n", cmd);
++        return -EOPNOTSUPP;
++    }
++}
++
++long do_nested_grant_table_op(unsigned int cmd,
++                              XEN_GUEST_HANDLE_PARAM(void) uop,
++                              unsigned int count)
++{
++    struct gnttab_query_size op;
++    long ret;
++
++    if ( !xen_nested )
++        return -ENOSYS;
++
++    if ( cmd != GNTTABOP_query_size )
++    {
++        gprintk(XENLOG_ERR, "Nested grant table op %u not supported.\n", cmd);
++        return -EOPNOTSUPP;
++    }
++
++    if ( count != 1 )
++        return -EINVAL;
++
++    if ( copy_from_guest(&op, uop, 1) )
++        return -EFAULT;
++
++    if ( op.dom != DOMID_SELF )
++        return -EPERM;
++
++    ret = xsm_nested_grant_query_size(XSM_PRIV, current->domain);
++    if ( ret )
++        return ret;
++
++    ret = xen_hypercall_grant_table_op(cmd, &op, 1);
++    if ( !ret && __copy_to_guest(uop, &op, 1) )
++        return -EFAULT;
++
++    return ret;
++}
++
++long do_nested_event_channel_op(int cmd, XEN_GUEST_HANDLE_PARAM(void) arg)
++{
++    long ret;
++
++    if ( !xen_nested )
++        return -ENOSYS;
++
++    ret = xsm_nested_event_channel_op(XSM_PRIV, current->domain, cmd);
++    if ( ret )
++        return ret;
++
++    switch ( cmd )
++    {
++    case EVTCHNOP_alloc_unbound:
++    {
++        struct evtchn_alloc_unbound alloc_unbound;
++
++        if ( copy_from_guest(&alloc_unbound, arg, 1) )
++            return -EFAULT;
++
++        ret = xen_hypercall_event_channel_op(cmd, &alloc_unbound);
++        if ( !ret && __copy_to_guest(arg, &alloc_unbound, 1) )
++        {
++            struct evtchn_close close;
++
++            ret = -EFAULT;
++            close.port = alloc_unbound.port;
++
++            if ( xen_hypercall_event_channel_op(EVTCHNOP_close, &close) )
++                gprintk(XENLOG_ERR, "Nested event alloc_unbound failed to close"
++                                    " port %u on EFAULT\n", alloc_unbound.port);
++        }
++        break;
++    }
++
++    case EVTCHNOP_bind_vcpu:
++    {
++       struct evtchn_bind_vcpu bind_vcpu;
++
++        if( copy_from_guest(&bind_vcpu, arg, 1) )
++            return -EFAULT;
++
++        return xen_hypercall_event_channel_op(cmd, &bind_vcpu);
++    }
++
++    case EVTCHNOP_close:
++    {
++        struct evtchn_close close;
++
++        if ( copy_from_guest(&close, arg, 1) )
++            return -EFAULT;
++
++        return xen_hypercall_event_channel_op(cmd, &close);
++    }
++
++    case EVTCHNOP_send:
++    {
++        struct evtchn_send send;
++
++        if ( copy_from_guest(&send, arg, 1) )
++            return -EFAULT;
++
++        return xen_hypercall_event_channel_op(cmd, &send);
++    }
++
++    case EVTCHNOP_unmask:
++    {
++        struct evtchn_unmask unmask;
++
++        if ( copy_from_guest(&unmask, arg, 1) )
++            return -EFAULT;
++
++        return xen_hypercall_event_channel_op(cmd, &unmask);
++    }
++
++    case EVTCHNOP_init_control:
++    {
++    	struct evtchn_init_control init_control;
++
++		if ( copy_from_guest(&init_control, arg, 1) )
++			return -EFAULT;
++
++		ret = xen_hypercall_event_channel_op(cmd, &init_control);
++		if ( !ret && __copy_to_guest(arg, &init_control, 1) )
++		{
++			gprintk(XENLOG_ERR, "Nested event init_control failed\n");
++			return -EFAULT;
++		}
++		//gprintk(XENLOG_ERR, "====XEN===EVTCHNOP_init_control succeed\n");
++		break;
++	}
++
++    case EVTCHNOP_expand_array:
++    {
++		struct evtchn_expand_array expand_array;
++
++		if ( copy_from_guest(&expand_array, arg, 1) != 0 )
++			return -EFAULT;
++
++		return xen_hypercall_event_channel_op(cmd, &expand_array);
++	}
++
++    case EVTCHNOP_set_priority:
++    {
++		struct evtchn_set_priority set_priority;
++
++		if ( copy_from_guest(&set_priority, arg, 1) != 0 )
++			return -EFAULT;
++
++		return xen_hypercall_event_channel_op(cmd, &set_priority);
++	}
++
++    case EVTCHNOP_bind_interdomain:
++	{
++		struct evtchn_bind_interdomain bind_interdomain;
++
++		if ( copy_from_guest(&bind_interdomain, arg, 1) )
++			return -EFAULT;
++
++		ret = xen_hypercall_event_channel_op(cmd, &bind_interdomain);
++		if ( !ret && __copy_to_guest(arg, &bind_interdomain, 1) )
++		{
++			gprintk(XENLOG_ERR, "Nested event bind_interdomain failed\n");
++			return -EFAULT;
++		}
++		break;
++	}
++
++    default:
++        gprintk(XENLOG_ERR, "Nested: event hypercall %d not supported.\n", cmd);
++        return -EOPNOTSUPP;
++    }
++
++    return ret;
++}
++
++long do_nested_sched_op(int cmd, XEN_GUEST_HANDLE_PARAM(void) arg)
++{
++    struct sched_shutdown sched_shutdown;
++    long ret;
++
++    if ( !xen_nested )
++        return -ENOSYS;
++
++    if ( cmd != SCHEDOP_shutdown )
++    {
++        gprintk(XENLOG_ERR, "Nested: sched op %d not supported.\n", cmd);
++        return -EOPNOTSUPP;
++    }
++
++    ret = xsm_nested_schedop_shutdown(XSM_PRIV, current->domain);
++    if ( ret )
++        return ret;
++
++    if ( copy_from_guest(&sched_shutdown, arg, 1) )
++        return -EFAULT;
++
++    return xen_hypercall_sched_op(cmd, &sched_shutdown);
++}
+diff -Naur clean_version/xen-4.13.0/xen/arch/x86/hypercall.c xen-4.13.0/xen/arch/x86/hypercall.c
+--- clean_version/xen-4.13.0/xen/arch/x86/hypercall.c	2019-12-17 09:23:09.000000000 -0500
++++ xen-4.13.0/xen/arch/x86/hypercall.c	2020-03-30 10:23:00.344834218 -0400
+@@ -73,6 +73,14 @@
+     ARGS(hvm_op, 2),
+     ARGS(dm_op, 3),
+ #endif
++#ifdef CONFIG_XEN_NESTED
++    ARGS(nested_xen_version, 2),
++    COMP(nested_memory_op, 2, 2),
++    ARGS(nested_hvm_op, 2),
++    ARGS(nested_grant_table_op, 3),
++    ARGS(nested_event_channel_op, 2),
++    ARGS(nested_sched_op, 2),
++#endif
+     ARGS(mca, 1),
+     ARGS(arch_1, 1),
+ };
+diff -Naur clean_version/xen-4.13.0/xen/arch/x86/irq.c xen-4.13.0/xen/arch/x86/irq.c
+--- clean_version/xen-4.13.0/xen/arch/x86/irq.c	2019-12-17 09:23:09.000000000 -0500
++++ xen-4.13.0/xen/arch/x86/irq.c	2020-03-30 10:23:00.345834252 -0400
+@@ -910,6 +910,10 @@
+     this_cpu(irq_count)++;
+     irq_enter();
+ 
++    //if(vector == 0xf3) {
++    //	printk("====XEN====vector 0xfs is called, IRQ:%d\n", irq);
++    //}
++
+     if (irq < 0) {
+         if (direct_apic_vector[vector] != NULL) {
+             (*direct_apic_vector[vector])(regs);
+diff -Naur clean_version/xen-4.13.0/xen/arch/x86/Kconfig xen-4.13.0/xen/arch/x86/Kconfig
+--- clean_version/xen-4.13.0/xen/arch/x86/Kconfig	2019-12-17 09:23:09.000000000 -0500
++++ xen-4.13.0/xen/arch/x86/Kconfig	2020-03-30 10:23:00.307832961 -0400
+@@ -161,11 +161,20 @@
+ 
+ endchoice
+ 
++config XEN_DETECT
++	def_bool y
++	prompt "Xen Detection"
++	---help---
++	  Support for Xen detecting when it is running under Xen.
++
++	  If unsure, say Y.
++
+ config XEN_GUEST
+ 	def_bool n
+ 	prompt "Xen Guest"
++	depends on XEN_DETECT
+ 	---help---
+-	  Support for Xen detecting when it is running under Xen.
++	  Common PVH_GUEST and PV_SHIM logic for Xen as a Xen-aware guest.
+ 
+ 	  If unsure, say N.
+ 
+@@ -204,6 +213,27 @@
+ 	bool "Xen memory sharing support" if EXPERT = "y"
+ 	depends on HVM
+ 
++config XEN_NESTED
++	bool "Xen PV driver interface for nested Xen" if EXPERT = "y"
++	depends on XEN_DETECT
++	---help---
++	  Enables a second PV driver interface in the hypervisor to support running
++	  two sets of PV drivers within a single privileged guest (eg. guest dom0)
++	  of a system running Xen under Xen:
++
++	  1) host set: frontends to access devices provided by lower hypervisor
++	  2) guest set: backends to support existing PV drivers in nested guest VMs
++
++	  This interface supports the host set of drivers and performs proxying of a
++	  limited set of hypercall operations from the guest to the host hypervisor.
++
++	  This feature is for the guest hypervisor and is transparent to the
++	  host hypervisor. Guest VMs of the guest hypervisor use the standard
++	  PV driver interfaces and unmodified drivers.
++
++	  Feature is also known as "The Xen-Blanket", presented at Eurosys 2012.
++
++	  If unsure, say N.
+ endmenu
+ 
+ source "common/Kconfig"
+diff -Naur clean_version/xen-4.13.0/xen/arch/x86/Makefile xen-4.13.0/xen/arch/x86/Makefile
+--- clean_version/xen-4.13.0/xen/arch/x86/Makefile	2019-12-17 09:23:09.000000000 -0500
++++ xen-4.13.0/xen/arch/x86/Makefile	2020-03-30 10:23:00.307832961 -0400
+@@ -1,7 +1,7 @@
+ subdir-y += acpi
+ subdir-y += cpu
+ subdir-y += genapic
+-subdir-$(CONFIG_XEN_GUEST) += guest
++subdir-$(CONFIG_XEN_DETECT) += guest
+ subdir-$(CONFIG_HVM) += hvm
+ subdir-y += mm
+ subdir-$(CONFIG_XENOPROF) += oprofile
+diff -Naur clean_version/xen-4.13.0/xen/arch/x86/pv/hypercall.c xen-4.13.0/xen/arch/x86/pv/hypercall.c
+--- clean_version/xen-4.13.0/xen/arch/x86/pv/hypercall.c	2019-12-17 09:23:09.000000000 -0500
++++ xen-4.13.0/xen/arch/x86/pv/hypercall.c	2020-03-30 10:23:00.369835067 -0400
+@@ -84,6 +84,14 @@
+     HYPERCALL(hvm_op),
+     COMPAT_CALL(dm_op),
+ #endif
++#ifdef CONFIG_XEN_NESTED
++    HYPERCALL(nested_xen_version),
++    COMPAT_CALL(nested_memory_op),
++    HYPERCALL(nested_hvm_op),
++    HYPERCALL(nested_grant_table_op),
++    HYPERCALL(nested_event_channel_op),
++    HYPERCALL(nested_sched_op),
++#endif
+     HYPERCALL(mca),
+     HYPERCALL(arch_1),
+ };
+diff -Naur clean_version/xen-4.13.0/xen/arch/x86/setup.c xen-4.13.0/xen/arch/x86/setup.c
+--- clean_version/xen-4.13.0/xen/arch/x86/setup.c	2019-12-17 09:23:09.000000000 -0500
++++ xen-4.13.0/xen/arch/x86/setup.c	2020-03-30 10:23:00.370835101 -0400
+@@ -780,6 +780,9 @@
+     ehci_dbgp_init();
+     console_init_preirq();
+ 
++    if ( xen_detected )
++        hypervisor_print_info();
++
+     if ( pvh_boot )
+         pvh_print_info();
+ 
+diff -Naur clean_version/xen-4.13.0/xen/common/event_channel.c xen-4.13.0/xen/common/event_channel.c
+--- clean_version/xen-4.13.0/xen/common/event_channel.c	2019-12-17 09:23:09.000000000 -0500
++++ xen-4.13.0/xen/common/event_channel.c	2020-03-30 10:23:00.395835950 -0400
+@@ -740,9 +740,12 @@
+     spin_lock_irqsave(&v->virq_lock, flags);
+ 
+     port = v->virq_to_evtchn[virq];
+-    if ( unlikely(port == 0) )
++    if ( unlikely(port == 0) ){
+         goto out;
++    }
+ 
++    //if (virq == VIRQ_ARCH_4)
++    	//printk("====XEN-Blanket==== sending VIRQ_ARCH_4 to cpu %d\n", v->vcpu_id);
+     d = v->domain;
+     evtchn_port_set_pending(d, v->vcpu_id, evtchn_from_port(d, port));
+ 
+diff -Naur clean_version/xen-4.13.0/xen/.config xen-4.13.0/xen/.config
+--- clean_version/xen-4.13.0/xen/.config	1969-12-31 19:00:00.000000000 -0500
++++ xen-4.13.0/xen/.config	2020-03-30 10:23:00.280832044 -0400
+@@ -0,0 +1,116 @@
++#
++# Automatically generated file; DO NOT EDIT.
++# Xen/x86 4.13.0 Configuration
++#
++CONFIG_X86_64=y
++CONFIG_X86=y
++CONFIG_ARCH_DEFCONFIG="arch/x86/configs/x86_64_defconfig"
++
++#
++# Architecture Features
++#
++CONFIG_NR_CPUS=256
++CONFIG_PV=y
++CONFIG_PV_LINEAR_PT=y
++CONFIG_HVM=y
++CONFIG_SHADOW_PAGING=y
++# CONFIG_BIGMEM is not set
++CONFIG_HVM_FEP=y
++CONFIG_TBOOT=y
++CONFIG_XEN_ALIGN_DEFAULT=y
++# CONFIG_XEN_ALIGN_2M is not set
++CONFIG_XEN_DETECT=y
++# CONFIG_XEN_GUEST is not set
++# CONFIG_MEM_SHARING is not set
++CONFIG_XEN_NESTED=y
++
++#
++# Common Features
++#
++CONFIG_COMPAT=y
++CONFIG_CORE_PARKING=y
++CONFIG_GRANT_TABLE=y
++CONFIG_HAS_ALTERNATIVE=y
++CONFIG_HAS_EX_TABLE=y
++CONFIG_HAS_FAST_MULTIPLY=y
++CONFIG_MEM_ACCESS_ALWAYS_ON=y
++CONFIG_MEM_ACCESS=y
++CONFIG_HAS_MEM_PAGING=y
++CONFIG_HAS_PDX=y
++CONFIG_HAS_UBSAN=y
++CONFIG_HAS_KEXEC=y
++CONFIG_HAS_GDBSX=y
++CONFIG_HAS_IOPORTS=y
++CONFIG_HAS_SCHED_GRANULARITY=y
++CONFIG_NEEDS_LIBELF=y
++
++#
++# Speculative hardening
++#
++CONFIG_SPECULATIVE_HARDEN_ARRAY=y
++CONFIG_SPECULATIVE_HARDEN_BRANCH=y
++CONFIG_KEXEC=y
++# CONFIG_EFI_SET_VIRTUAL_ADDRESS_MAP is not set
++CONFIG_XENOPROF=y
++# CONFIG_XSM is not set
++# CONFIG_ARGO is not set
++
++#
++# Schedulers
++#
++CONFIG_SCHED_CREDIT=y
++CONFIG_SCHED_CREDIT2=y
++CONFIG_SCHED_RTDS=y
++CONFIG_SCHED_ARINC653=y
++CONFIG_SCHED_NULL=y
++# CONFIG_SCHED_CREDIT_DEFAULT is not set
++CONFIG_SCHED_CREDIT2_DEFAULT=y
++# CONFIG_SCHED_RTDS_DEFAULT is not set
++# CONFIG_SCHED_ARINC653_DEFAULT is not set
++# CONFIG_SCHED_NULL_DEFAULT is not set
++CONFIG_SCHED_DEFAULT="credit2"
++CONFIG_CRYPTO=y
++CONFIG_LIVEPATCH=y
++CONFIG_FAST_SYMBOL_LOOKUP=y
++CONFIG_ENFORCE_UNIQUE_SYMBOLS=y
++CONFIG_CMDLINE=""
++CONFIG_DOM0_MEM=""
++CONFIG_TRACEBUFFER=y
++
++#
++# Device Drivers
++#
++CONFIG_ACPI=y
++CONFIG_ACPI_LEGACY_TABLES_LOOKUP=y
++CONFIG_NUMA=y
++CONFIG_HAS_NS16550=y
++CONFIG_HAS_EHCI=y
++CONFIG_HAS_CPUFREQ=y
++CONFIG_HAS_PASSTHROUGH=y
++CONFIG_HAS_PCI=y
++CONFIG_VIDEO=y
++CONFIG_VGA=y
++CONFIG_HAS_VPCI=y
++
++#
++# Deprecated Functionality
++#
++# CONFIG_PV_LDT_PAGING is not set
++CONFIG_DEFCONFIG_LIST="arch/x86/configs/x86_64_defconfig"
++CONFIG_ARCH_SUPPORTS_INT128=y
++
++#
++# Debugging Options
++#
++CONFIG_DEBUG=y
++# CONFIG_CRASH_DEBUG is not set
++CONFIG_DEBUG_INFO=y
++CONFIG_FRAME_POINTER=y
++# CONFIG_DEBUG_LOCK_PROFILE is not set
++CONFIG_DEBUG_LOCKS=y
++# CONFIG_PERF_COUNTERS is not set
++CONFIG_VERBOSE_DEBUG=y
++CONFIG_SCRUB_DEBUG=y
++# CONFIG_UBSAN is not set
++# CONFIG_DEBUG_TRACE is not set
++CONFIG_XMEM_POOL_POISON=y
+diff -Naur clean_version/xen-4.13.0/xen/include/asm-x86/event.h xen-4.13.0/xen/include/asm-x86/event.h
+--- clean_version/xen-4.13.0/xen/include/asm-x86/event.h	2019-12-17 09:23:09.000000000 -0500
++++ xen-4.13.0/xen/include/asm-x86/event.h	2020-03-30 10:23:00.465838328 -0400
+@@ -10,6 +10,7 @@
+ #define __ASM_EVENT_H__
+ 
+ #include <xen/shared.h>
++#include <public/xen.h>
+ 
+ void vcpu_kick(struct vcpu *v);
+ void vcpu_mark_events_pending(struct vcpu *v);
+@@ -44,7 +45,7 @@
+ /* No arch specific virq definition now. Default to global. */
+ static inline bool arch_virq_is_global(unsigned int virq)
+ {
+-    return true;
++    return virq==VIRQ_ARCH_4 ? false:true;
+ }
+ 
+ #endif
+diff -Naur clean_version/xen-4.13.0/xen/include/asm-x86/fixmap.h xen-4.13.0/xen/include/asm-x86/fixmap.h
+--- clean_version/xen-4.13.0/xen/include/asm-x86/fixmap.h	2019-12-17 09:23:09.000000000 -0500
++++ xen-4.13.0/xen/include/asm-x86/fixmap.h	2020-03-30 10:23:00.465838328 -0400
+@@ -47,6 +47,9 @@
+     FIX_PV_CONSOLE,
+     FIX_XEN_SHARED_INFO,
+ #endif /* CONFIG_XEN_GUEST */
++#ifdef CONFIG_XEN_NESTED
++    FIX_XEN_SHARED_INFO,
++#endif /* CONFIG_XEN_GUEST */
+     /* Everything else should go further down. */
+     FIX_APIC_BASE,
+     FIX_IO_APIC_BASE_0,
+diff -Naur clean_version/xen-4.13.0/xen/include/asm-x86/guest/hypercall.h xen-4.13.0/xen/include/asm-x86/guest/hypercall.h
+--- clean_version/xen-4.13.0/xen/include/asm-x86/guest/hypercall.h	2019-12-17 09:23:09.000000000 -0500
++++ xen-4.13.0/xen/include/asm-x86/guest/hypercall.h	2020-03-30 10:23:00.465838328 -0400
+@@ -19,7 +19,7 @@
+ #ifndef __X86_XEN_HYPERCALL_H__
+ #define __X86_XEN_HYPERCALL_H__
+ 
+-#ifdef CONFIG_XEN_GUEST
++#if defined(CONFIG_XEN_GUEST) || defined (CONFIG_XEN_NESTED)
+ 
+ #include <xen/types.h>
+ 
+@@ -123,6 +123,11 @@
+     return _hypercall64_2(long, __HYPERVISOR_hvm_op, op, arg);
+ }
+ 
++static inline long xen_hypercall_xen_version(unsigned int op, void *arg)
++{
++    return _hypercall64_2(long, __HYPERVISOR_xen_version, op, arg);
++}
++
+ /*
+  * Higher level hypercall helpers
+  */
+diff -Naur clean_version/xen-4.13.0/xen/include/asm-x86/guest/xen.h xen-4.13.0/xen/include/asm-x86/guest/xen.h
+--- clean_version/xen-4.13.0/xen/include/asm-x86/guest/xen.h	2019-12-17 09:23:09.000000000 -0500
++++ xen-4.13.0/xen/include/asm-x86/guest/xen.h	2020-03-30 10:23:00.465838328 -0400
+@@ -24,20 +24,48 @@
+ #include <asm/e820.h>
+ #include <asm/fixmap.h>
+ 
++#ifdef CONFIG_XEN_DETECT
++
++extern bool xen_detected;
++
++void probe_hypervisor(void);
++void hypervisor_print_info(void);
++uint32_t hypervisor_cpuid_base(void);
++
++#else
++
++#define xen_detected 0
++
++static inline void probe_hypervisor(void) {}
++static inline void hypervisor_print_info(void) {
++    ASSERT_UNREACHABLE();
++}
++
++#endif /* CONFIG_XEN_DETECT */
++
++#ifdef CONFIG_XEN_NESTED
++
++void xen_nested_enable(void);
+ #define XEN_shared_info ((struct shared_info *)fix_to_virt(FIX_XEN_SHARED_INFO))
+ 
++#else
++
++static inline void xen_nested_enable(void) {}
++
++#endif /* CONFIG_XEN_NESTED */
++
+ #ifdef CONFIG_XEN_GUEST
++#define XEN_shared_info ((struct shared_info *)fix_to_virt(FIX_XEN_SHARED_INFO))
+ 
+ extern bool xen_guest;
+ extern bool pv_console;
+ 
+-void probe_hypervisor(void);
+ void hypervisor_setup(void);
+ void hypervisor_ap_setup(void);
+ int hypervisor_alloc_unused_page(mfn_t *mfn);
+ int hypervisor_free_unused_page(mfn_t mfn);
+-uint32_t hypervisor_cpuid_base(void);
+ void hypervisor_resume(void);
++void xen_guest_enable(void);
+ 
+ DECLARE_PER_CPU(unsigned int, vcpu_id);
+ DECLARE_PER_CPU(struct vcpu_info *, vcpu_info);
+@@ -47,8 +75,6 @@
+ #define xen_guest 0
+ #define pv_console 0
+ 
+-static inline void probe_hypervisor(void) {}
+-
+ static inline void hypervisor_setup(void)
+ {
+     ASSERT_UNREACHABLE();
+@@ -57,6 +83,7 @@
+ {
+     ASSERT_UNREACHABLE();
+ }
++static inline void xen_guest_enable(void) {}
+ 
+ #endif /* CONFIG_XEN_GUEST */
+ #endif /* __X86_GUEST_XEN_H__ */
+diff -Naur clean_version/xen-4.13.0/xen/include/public/xen.h xen-4.13.0/xen/include/public/xen.h
+--- clean_version/xen-4.13.0/xen/include/public/xen.h	2019-12-17 09:23:09.000000000 -0500
++++ xen-4.13.0/xen/include/public/xen.h	2020-03-30 10:23:00.493839279 -0400
+@@ -130,6 +130,12 @@
+ #define __HYPERVISOR_argo_op              39
+ #define __HYPERVISOR_xenpmu_op            40
+ #define __HYPERVISOR_dm_op                41
++#define __HYPERVISOR_nested_xen_version   42
++#define __HYPERVISOR_nested_memory_op     43
++#define __HYPERVISOR_nested_hvm_op        44
++#define __HYPERVISOR_nested_grant_table_op 45
++#define __HYPERVISOR_nested_event_channel_op 46
++#define __HYPERVISOR_nested_sched_op      47
+ 
+ /* Architecture-specific hypercall definitions. */
+ #define __HYPERVISOR_arch_0               48
+diff -Naur clean_version/xen-4.13.0/xen/include/xen/hypercall.h xen-4.13.0/xen/include/xen/hypercall.h
+--- clean_version/xen-4.13.0/xen/include/xen/hypercall.h	2019-12-17 09:23:09.000000000 -0500
++++ xen-4.13.0/xen/include/xen/hypercall.h	2020-03-30 10:23:00.495839347 -0400
+@@ -150,6 +150,33 @@
+     unsigned int nr_bufs,
+     XEN_GUEST_HANDLE_PARAM(xen_dm_op_buf_t) bufs);
+ 
++#ifdef CONFIG_XEN_NESTED
++extern long do_nested_xen_version(
++    int cmd,
++    XEN_GUEST_HANDLE_PARAM(void) arg);
++
++extern long do_nested_memory_op(
++    int cmd,
++    XEN_GUEST_HANDLE_PARAM(void) arg);
++
++extern long do_nested_hvm_op(
++    int cmd,
++    XEN_GUEST_HANDLE_PARAM(void) arg);
++
++extern long do_nested_grant_table_op(
++    unsigned int cmd,
++    XEN_GUEST_HANDLE_PARAM(void) uop,
++    unsigned int count);
++
++extern long do_nested_event_channel_op(
++    int cmd,
++    XEN_GUEST_HANDLE_PARAM(void) arg);
++
++extern long do_nested_sched_op(
++    int cmd,
++    XEN_GUEST_HANDLE_PARAM(void) arg);
++#endif
++
+ #ifdef CONFIG_COMPAT
+ 
+ extern int
+@@ -216,6 +243,12 @@
+     unsigned int nr_bufs,
+     XEN_GUEST_HANDLE_PARAM(void) bufs);
+ 
++#ifdef CONFIG_XEN_NESTED
++extern int compat_nested_memory_op(
++    int cmd,
++    XEN_GUEST_HANDLE_PARAM(void) arg);
++#endif
++
+ #endif
+ 
+ void arch_get_xen_caps(xen_capabilities_info_t *info);
+diff -Naur clean_version/xen-4.13.0/xen/include/xsm/dummy.h xen-4.13.0/xen/include/xsm/dummy.h
+--- clean_version/xen-4.13.0/xen/include/xsm/dummy.h	2019-12-17 09:23:09.000000000 -0500
++++ xen-4.13.0/xen/include/xsm/dummy.h	2020-03-30 10:23:00.509839823 -0400
+@@ -69,7 +69,7 @@
+ #endif /* CONFIG_XSM */
+ 
+ static always_inline int xsm_default_action(
+-    xsm_default_t action, struct domain *src, struct domain *target)
++    xsm_default_t action, const struct domain *src, const struct domain *target)
+ {
+     switch ( action ) {
+     case XSM_HOOK:
+@@ -739,6 +739,52 @@
+ 
+ #endif /* CONFIG_ARGO */
+ 
++#ifdef CONFIG_XEN_NESTED
++static XSM_INLINE int xsm_nested_xen_version(XSM_DEFAULT_ARG
++                                             const struct domain *d,
++                                             unsigned int cmd)
++{
++    XSM_ASSERT_ACTION(XSM_PRIV);
++    return xsm_default_action(action, d, NULL);
++}
++
++static XSM_INLINE int xsm_nested_add_to_physmap(XSM_DEFAULT_ARG
++                                                const struct domain *d)
++{
++    XSM_ASSERT_ACTION(XSM_PRIV);
++    return xsm_default_action(action, d, NULL);
++}
++
++static XSM_INLINE int xsm_nested_hvm_op(XSM_DEFAULT_ARG const struct domain *d,
++                                        unsigned int cmd)
++{
++    XSM_ASSERT_ACTION(XSM_PRIV);
++    return xsm_default_action(action, d, NULL);
++}
++
++static XSM_INLINE int xsm_nested_grant_query_size(XSM_DEFAULT_ARG
++                                                  const struct domain *d)
++{
++    XSM_ASSERT_ACTION(XSM_PRIV);
++    return xsm_default_action(action, d, NULL);
++}
++
++static XSM_INLINE int xsm_nested_event_channel_op(XSM_DEFAULT_ARG
++                                                  const struct domain *d,
++                                                  unsigned int cmd)
++{
++    XSM_ASSERT_ACTION(XSM_PRIV);
++    return xsm_default_action(action, d, NULL);
++}
++
++static XSM_INLINE int xsm_nested_schedop_shutdown(XSM_DEFAULT_ARG
++                                                  const struct domain *d)
++{
++    XSM_ASSERT_ACTION(XSM_PRIV);
++    return xsm_default_action(action, d, NULL);
++}
++#endif
++
+ #include <public/version.h>
+ static XSM_INLINE int xsm_xen_version (XSM_DEFAULT_ARG uint32_t op)
+ {
+diff -Naur clean_version/xen-4.13.0/xen/include/xsm/xsm.h xen-4.13.0/xen/include/xsm/xsm.h
+--- clean_version/xen-4.13.0/xen/include/xsm/xsm.h	2019-12-17 09:23:09.000000000 -0500
++++ xen-4.13.0/xen/include/xsm/xsm.h	2020-03-30 10:23:00.509839823 -0400
+@@ -187,6 +187,14 @@
+     int (*argo_register_any_source) (const struct domain *d);
+     int (*argo_send) (const struct domain *d, const struct domain *t);
+ #endif
++#ifdef CONFIG_XEN_NESTED
++    int (*nested_xen_version) (const struct domain *d, unsigned int cmd);
++    int (*nested_add_to_physmap) (const struct domain *d);
++    int (*nested_hvm_op) (const struct domain *d, unsigned int cmd);
++    int (*nested_grant_query_size) (const struct domain *d);
++    int (*nested_event_channel_op) (const struct domain *d, unsigned int cmd);
++    int (*nested_schedop_shutdown) (const struct domain *d);
++#endif
+ };
+ 
+ #ifdef CONFIG_XSM
+@@ -723,6 +731,47 @@
+ 
+ #endif /* CONFIG_ARGO */
+ 
++#ifdef CONFIG_XEN_NESTED
++static inline int xsm_nested_xen_version(xsm_default_t def,
++                                         const struct domain *d,
++                                         unsigned int cmd)
++{
++    return xsm_ops->nested_xen_version(d, cmd);
++}
++
++static inline int xsm_nested_add_to_physmap(xsm_default_t def,
++                                            const struct domain *d)
++{
++    return xsm_ops->nested_add_to_physmap(d);
++}
++
++static inline int xsm_nested_hvm_op(xsm_default_t def, const struct domain *d,
++                                    unsigned int cmd)
++{
++    return xsm_ops->nested_hvm_op(d, cmd);
++}
++
++static inline int xsm_nested_grant_query_size(xsm_default_t def,
++                                              const struct domain *d)
++{
++    return xsm_ops->nested_grant_query_size(d);
++}
++
++static inline int xsm_nested_event_channel_op(xsm_default_t def,
++                                              const struct domain *d,
++                                              unsigned int cmd)
++{
++    return xsm_ops->nested_event_channel_op(d, cmd);
++}
++
++static inline int xsm_nested_schedop_shutdown(xsm_default_t def,
++                                              const struct domain *d)
++{
++    return xsm_ops->nested_schedop_shutdown(d);
++}
++
++#endif /* CONFIG_XEN_NESTED */
++
+ #endif /* XSM_NO_WRAPPERS */
+ 
+ #ifdef CONFIG_MULTIBOOT
+diff -Naur clean_version/xen-4.13.0/xen/Makefile xen-4.13.0/xen/Makefile
+--- clean_version/xen-4.13.0/xen/Makefile	2019-12-17 09:23:09.000000000 -0500
++++ xen-4.13.0/xen/Makefile	2020-03-30 10:23:00.280832044 -0400
+@@ -11,7 +11,7 @@
+ export XEN_BUILD_DATE	?= $(shell LC_ALL=C date)
+ export XEN_BUILD_TIME	?= $(shell LC_ALL=C date +%T)
+ export XEN_BUILD_HOST	?= $(shell hostname)
+-export XEN_CONFIG_EXPERT ?= n
++export XEN_CONFIG_EXPERT ?= y
+ 
+ # Best effort attempt to find a python interpreter, defaulting to Python 3 if
+ # available.  Fall back to just `python` if `which` is nowhere to be found.
+diff -Naur clean_version/xen-4.13.0/xen/xsm/dummy.c xen-4.13.0/xen/xsm/dummy.c
+--- clean_version/xen-4.13.0/xen/xsm/dummy.c	2019-12-17 09:23:09.000000000 -0500
++++ xen-4.13.0/xen/xsm/dummy.c	2020-03-30 10:23:00.523840298 -0400
+@@ -157,4 +157,12 @@
+     set_to_dummy_if_null(ops, argo_register_any_source);
+     set_to_dummy_if_null(ops, argo_send);
+ #endif
++#ifdef CONFIG_XEN_NESTED
++    set_to_dummy_if_null(ops, nested_xen_version);
++    set_to_dummy_if_null(ops, nested_add_to_physmap);
++    set_to_dummy_if_null(ops, nested_hvm_op);
++    set_to_dummy_if_null(ops, nested_grant_query_size);
++    set_to_dummy_if_null(ops, nested_event_channel_op);
++    set_to_dummy_if_null(ops, nested_schedop_shutdown);
++#endif
+ }
+diff -Naur clean_version/xen-4.13.0/xen/xsm/flask/hooks.c xen-4.13.0/xen/xsm/flask/hooks.c
+--- clean_version/xen-4.13.0/xen/xsm/flask/hooks.c	2019-12-17 09:23:09.000000000 -0500
++++ xen-4.13.0/xen/xsm/flask/hooks.c	2020-03-30 10:23:00.524840332 -0400
+@@ -1667,46 +1667,56 @@
+ 
+ #endif /* CONFIG_X86 */
+ 
+-static int flask_xen_version (uint32_t op)
++static int domain_has_xen_version (const struct domain *d, u32 tsid,
++                                   uint32_t op)
+ {
+-    u32 dsid = domain_sid(current->domain);
++    u32 dsid = domain_sid(d);
+ 
+     switch ( op )
+     {
+     case XENVER_version:
+-    case XENVER_platform_parameters:
+-    case XENVER_get_features:
+-        /* These sub-ops ignore the permission checks and return data. */
+-        return 0;
++        return avc_has_perm(dsid, tsid, SECCLASS_VERSION,
++                            VERSION__XEN_VERSION, NULL);
+     case XENVER_extraversion:
+-        return avc_has_perm(dsid, SECINITSID_XEN, SECCLASS_VERSION,
++        return avc_has_perm(dsid, tsid, SECCLASS_VERSION,
+                             VERSION__XEN_EXTRAVERSION, NULL);
+     case XENVER_compile_info:
+-        return avc_has_perm(dsid, SECINITSID_XEN, SECCLASS_VERSION,
++        return avc_has_perm(dsid, tsid, SECCLASS_VERSION,
+                             VERSION__XEN_COMPILE_INFO, NULL);
+     case XENVER_capabilities:
+-        return avc_has_perm(dsid, SECINITSID_XEN, SECCLASS_VERSION,
++        return avc_has_perm(dsid, tsid, SECCLASS_VERSION,
+                             VERSION__XEN_CAPABILITIES, NULL);
+     case XENVER_changeset:
+-        return avc_has_perm(dsid, SECINITSID_XEN, SECCLASS_VERSION,
++        return avc_has_perm(dsid, tsid, SECCLASS_VERSION,
+                             VERSION__XEN_CHANGESET, NULL);
++    case XENVER_platform_parameters:
++        return avc_has_perm(dsid, tsid, SECCLASS_VERSION,
++                            VERSION__XEN_PLATFORM_PARAMETERS, NULL);
++    case XENVER_get_features:
++        return avc_has_perm(dsid, tsid, SECCLASS_VERSION,
++                            VERSION__XEN_GET_FEATURES, NULL);
+     case XENVER_pagesize:
+-        return avc_has_perm(dsid, SECINITSID_XEN, SECCLASS_VERSION,
++        return avc_has_perm(dsid, tsid, SECCLASS_VERSION,
+                             VERSION__XEN_PAGESIZE, NULL);
+     case XENVER_guest_handle:
+-        return avc_has_perm(dsid, SECINITSID_XEN, SECCLASS_VERSION,
++        return avc_has_perm(dsid, tsid, SECCLASS_VERSION,
+                             VERSION__XEN_GUEST_HANDLE, NULL);
+     case XENVER_commandline:
+-        return avc_has_perm(dsid, SECINITSID_XEN, SECCLASS_VERSION,
++        return avc_has_perm(dsid, tsid, SECCLASS_VERSION,
+                             VERSION__XEN_COMMANDLINE, NULL);
+     case XENVER_build_id:
+-        return avc_has_perm(dsid, SECINITSID_XEN, SECCLASS_VERSION,
++        return avc_has_perm(dsid, tsid, SECCLASS_VERSION,
+                             VERSION__XEN_BUILD_ID, NULL);
+     default:
+         return -EPERM;
+     }
+ }
+ 
++static int flask_xen_version (uint32_t op)
++{
++    return domain_has_xen_version(current->domain, SECINITSID_XEN, op);
++}
++
+ static int flask_domain_resource_map(struct domain *d)
+ {
+     return current_has_perm(d, SECCLASS_DOMAIN2, DOMAIN2__RESOURCE_MAP);
+@@ -1739,6 +1749,93 @@
+ 
+ #endif
+ 
++#ifdef CONFIG_XEN_NESTED
++static int domain_has_nested_perm(const struct domain *d, u16 class, u32 perm)
++{
++    struct avc_audit_data ad;
++
++    AVC_AUDIT_DATA_INIT(&ad, NONE);
++
++    return avc_has_perm(domain_sid(d), SECINITSID_NESTEDXEN, class, perm, &ad);
++}
++
++static int flask_nested_add_to_physmap(const struct domain *d)
++{
++    return domain_has_nested_perm(d, SECCLASS_MMU, MMU__PHYSMAP);
++}
++
++static int flask_nested_xen_version(const struct domain *d, unsigned int op)
++{
++    return domain_has_xen_version(d, SECINITSID_NESTEDXEN, op);
++}
++
++static int flask_nested_hvm_op(const struct domain *d, unsigned int op)
++{
++    u32 perm;
++
++    switch ( op )
++    {
++    case HVMOP_set_param:
++        perm = HVM__SETPARAM;
++        break;
++
++    case HVMOP_get_param:
++        perm = HVM__GETPARAM;
++        break;
++
++    default:
++        perm = HVM__HVMCTL;
++    }
++
++    return domain_has_nested_perm(d, SECCLASS_HVM, perm);
++}
++
++static int flask_nested_grant_query_size(const struct domain *d)
++{
++    return domain_has_nested_perm(d, SECCLASS_GRANT, GRANT__QUERY);
++}
++
++static int flask_nested_event_channel_op(const struct domain *d,
++                                         unsigned int op)
++{
++    u32 perm;
++
++    switch ( op )
++    {
++    case EVTCHNOP_alloc_unbound:
++        perm = NESTED_EVENT__ALLOC_UNBOUND;
++        break;
++
++    case EVTCHNOP_bind_vcpu:
++        perm = NESTED_EVENT__BIND_VCPU;
++        break;
++
++    case EVTCHNOP_close:
++        perm = NESTED_EVENT__CLOSE;
++        break;
++
++    case EVTCHNOP_send:
++        perm = NESTED_EVENT__SEND;
++        break;
++
++    case EVTCHNOP_unmask:
++        perm = NESTED_EVENT__UNMASK;
++        break;
++
++    default:
++        return avc_unknown_permission("nested event channel op", op);
++    }
++
++    return domain_has_nested_perm(d, SECCLASS_NESTED_EVENT, perm);
++}
++
++static int flask_nested_schedop_shutdown(const struct domain *d)
++{
++    return domain_has_nested_perm(d, SECCLASS_DOMAIN, DOMAIN__SHUTDOWN);
++}
++
++#endif
++
+ long do_flask_op(XEN_GUEST_HANDLE_PARAM(xsm_op_t) u_flask_op);
+ int compat_flask_op(XEN_GUEST_HANDLE_PARAM(xsm_op_t) u_flask_op);
+ 
+@@ -1878,6 +1975,14 @@
+     .argo_register_any_source = flask_argo_register_any_source,
+     .argo_send = flask_argo_send,
+ #endif
++#ifdef CONFIG_XEN_NESTED
++    .nested_xen_version = flask_nested_xen_version,
++    .nested_add_to_physmap = flask_nested_add_to_physmap,
++    .nested_hvm_op = flask_nested_hvm_op,
++    .nested_grant_query_size = flask_nested_grant_query_size,
++    .nested_event_channel_op = flask_nested_event_channel_op,
++    .nested_schedop_shutdown = flask_nested_schedop_shutdown,
++#endif
+ };
+ 
+ void __init flask_init(const void *policy_buffer, size_t policy_size)
+diff -Naur clean_version/xen-4.13.0/xen/xsm/flask/policy/access_vectors xen-4.13.0/xen/xsm/flask/policy/access_vectors
+--- clean_version/xen-4.13.0/xen/xsm/flask/policy/access_vectors	2019-12-17 09:23:09.000000000 -0500
++++ xen-4.13.0/xen/xsm/flask/policy/access_vectors	2020-03-30 10:23:00.524840332 -0400
+@@ -315,6 +315,26 @@
+     reset
+ }
+ 
++# Class nested_event describes event channels to the host hypervisor
++# in a nested Xen-on-Xen system. Policy controls for these differ
++# from the interdomain event channels between guest VMs:
++# the guest hypervisor does not maintain security identifier information about
++# the remote event endpoint managed by the host hypervisor, so nested_event
++# channels do not have their own security label derived from a type transition.
++class nested_event
++{
++    # nested_event_channel_op: EVTCHNOP_alloc_unbound
++    alloc_unbound
++    # nested_event_channel_op: EVTCHNOP_bind_vcpu
++    bind_vcpu
++    # nested_event_channel_op: EVTCHNOP_close
++    close
++    # nested_event_channel_op: EVTCHNOP_send
++    send
++    # nested_event_channel_op: EVTCHNOP_unmask
++    unmask
++}
++
+ # Class grant describes pages shared by grant mappings.  Pages use the security
+ # label of their owning domain.
+ class grant
+@@ -509,6 +529,8 @@
+ #
+ class version
+ {
++# Basic information
++    xen_version
+ # Extra informations (-unstable).
+     xen_extraversion
+ # Compile information of the hypervisor.
+@@ -517,6 +539,10 @@
+     xen_capabilities
+ # Source code changeset.
+     xen_changeset
++# Hypervisor virt start
++    xen_platform_parameters
++# Query for bitmap of platform features
++    xen_get_features
+ # Page size the hypervisor uses.
+     xen_pagesize
+ # An value that the control stack can choose.
+diff -Naur clean_version/xen-4.13.0/xen/xsm/flask/policy/initial_sids xen-4.13.0/xen/xsm/flask/policy/initial_sids
+--- clean_version/xen-4.13.0/xen/xsm/flask/policy/initial_sids	2019-12-17 09:23:09.000000000 -0500
++++ xen-4.13.0/xen/xsm/flask/policy/initial_sids	2020-03-30 10:23:00.524840332 -0400
+@@ -15,4 +15,5 @@
+ sid device
+ sid domU
+ sid domDM
++sid nestedxen
+ # FLASK
+diff -Naur clean_version/xen-4.13.0/xen/xsm/flask/policy/security_classes xen-4.13.0/xen/xsm/flask/policy/security_classes
+--- clean_version/xen-4.13.0/xen/xsm/flask/policy/security_classes	2019-12-17 09:23:09.000000000 -0500
++++ xen-4.13.0/xen/xsm/flask/policy/security_classes	2020-03-30 10:23:00.524840332 -0400
+@@ -20,5 +20,6 @@
+ class security
+ class version
+ class argo
++class nested_event
+ 
+ # FLASK
