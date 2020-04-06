@@ -2,7 +2,11 @@
 
 Xen-Blanket is a nested-virtualization solution that works without hardware or software support from underlying cloud providers. With Xen-Blanket, you can get hypervisor-level control by running a second-layer Xen hypervisor within virtual machines (VMs) running in clouds. For more information, check out the paper: [The Xen-Blanket: Virtualize Once, Run Everywhere](http://fireless.cs.cornell.edu/publications/xen-blanket.pdf), in EuroSys 2012.
 
-This is a new version of XenBlanket based on Xen 4.13.0 and Linux kernel 4.15.5. It can run on top of Xen and KVM hypervisors. 
+This is a new version of XenBlanket based on Xen 4.13.0 and Linux kernel 4.15.5. Supported underlying (first-layer) hypervisors:
+
+  * Xen
+  * KVM
+  * VMware ESXi
 
 ## Installation
 
