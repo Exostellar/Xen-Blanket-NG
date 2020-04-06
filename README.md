@@ -20,7 +20,22 @@ cd xen-4.13.0
 patch -p1 <../xen-4.13.0.patch
 ```
 
-You can now build and install Linux and Xen as normal. Refer to the README files included in the source files. For Linux kernel, you need to **enable Xen Dom0 support** in the configuration. This can be done by typing `make xenconfig` before compilation. If you are running on KVM, `make kvmconfig` is useful. A sample `kernel_config` has been provided.
+You can now build and install Linux and Xen as normal. Refer to the README files included in the source files. 
+
+### Kernel configuration requirements
+
+For Linux kernel, you need to **enable Xen Dom0 support** in the configuration. This can be done by typing `make xenconfig` before compilation. If you are running on KVM, `make kvmconfig` is useful. A sample `kernel_config` has been provided.
+
+### Grub configuration requirements
+
+For this version of Xen-Blanket, `dom0_vcpus_pin=true` is **required** in the command line options for Xen. You can add the following lines to `/etc/default/grub` (adjust the CPU and memory allocation according to your setup):
+
+```
+GRUB_CMDLINE_XEN_DEFAULT="dom0_max_vcpus=4 dom0_mem=4096M,max:4096M dom0_vcpus_pin=true"
+GRUB_CMDLINE_LINUX_XEN_REPLACE_DEFAULT="console=hvc0 earlyprintk=xen nomodeset"
+```
+
+Make sure that your `/boot` folder contains necessary kernel config file (i.e., ` /boot/config-4.15.5-xennested`) before generating the grub file with `grub2-mkconfig -o /boot/grub2/grub.cfg`.
 
 ## Acknowledgements
 
